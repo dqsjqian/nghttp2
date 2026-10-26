@@ -86,6 +86,15 @@ typedef ptrdiff_t nghttp2_ssize;
 /**
  * @macro
  *
+ * Defined when every 2xx response to CONNECT, including 204, permits
+ * tunnel DATA and ignores Content-Length.  Non-2xx responses retain
+ * ordinary HTTP response framing.
+ */
+#define NGHTTP2_HAS_CONNECT_2XX_TUNNEL 1
+
+/**
+ * @macro
+ *
  * The protocol version identification string of this library
  * supports.  This identifier is used if HTTP/2 is used over TLS.
  */
