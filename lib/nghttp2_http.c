@@ -346,6 +346,12 @@ static int http_response_on_header(nghttp2_stream *stream, nghttp2_hd_nv *nv) {
     break;
   }
   case NGHTTP2_TOKEN_CONTENT_LENGTH: {
+    /* RFC 9110, Section 9.3.6: every successful CONNECT response starts
+       a tunnel, including 204.  Its content-length must be ignored. */
+    if (stream->status_code / 100 == 2 &&
+        (stream->http_flags & NGHTTP2_HTTP_FLAG_METH_CONNECT)) {
+      return NGHTTP2_ERR_REMOVE_HTTP_HEADER;
+    }
     if (stream->status_code == 204) {
       /* content-length header field in 204 response is prohibited by
          RFC 7230.  But some widely used servers send content-length:
@@ -362,11 +368,6 @@ static int http_response_on_header(nghttp2_stream *stream, nghttp2_hd_nv *nv) {
     }
     if (stream->status_code / 100 == 1) {
       return NGHTTP2_ERR_HTTP_HEADER;
-    }
-    /* https://tools.ietf.org/html/rfc7230#section-3.3.3 */
-    if (stream->status_code / 100 == 2 &&
-        (stream->http_flags & NGHTTP2_HTTP_FLAG_METH_CONNECT)) {
-      return NGHTTP2_ERR_REMOVE_HTTP_HEADER;
     }
     if (stream->content_length != -1) {
       return NGHTTP2_ERR_HTTP_HEADER;
@@ -500,10 +501,13 @@ int nghttp2_http_on_response_headers(nghttp2_stream *stream) {
   stream->http_flags =
     stream->http_flags & ~NGHTTP2_HTTP_FLAG_EXPECT_FINAL_RESPONSE;
 
-  if (!expect_response_body(stream)) {
+  if (stream->status_code / 100 == 2 &&
+      (stream->http_flags & NGHTTP2_HTTP_FLAG_METH_CONNECT)) {
+    /* Tunnel DATA is not response content, even for status 204. */
+    stream->content_length = -1;
+  } else if (!expect_response_body(stream)) {
     stream->content_length = 0;
-  } else if (stream->http_flags & (NGHTTP2_HTTP_FLAG_METH_CONNECT |
-                                   NGHTTP2_HTTP_FLAG_METH_UPGRADE_WORKAROUND)) {
+  } else if (stream->http_flags & NGHTTP2_HTTP_FLAG_METH_UPGRADE_WORKAROUND) {
     stream->content_length = -1;
   }
 

@@ -165,6 +165,7 @@ static const MunitTest tests[] = {
   munit_void_test(test_nghttp2_http_trailer_headers),
   munit_void_test(test_nghttp2_http_ignore_regular_header),
   munit_void_test(test_nghttp2_http_ignore_content_length),
+  munit_void_test(test_nghttp2_http_connect_2xx_tunnel),
   munit_void_test(test_nghttp2_http_record_request_method),
   munit_void_test(test_nghttp2_http_push_promise),
   munit_void_test(test_nghttp2_http_head_method_upgrade_workaround),
@@ -11962,6 +11963,149 @@ void test_nghttp2_http_ignore_content_length(void) {
   nghttp2_hd_deflate_free(&deflater);
   nghttp2_session_del(session);
   nghttp2_bufs_free(&bufs);
+}
+
+static int tunnel_data_chunk_recv_callback(nghttp2_session *session,
+                                           uint8_t flags, int32_t stream_id,
+                                           const uint8_t *data, size_t len,
+                                           void *user_data) {
+  accumulator *acc = user_data;
+  (void)session;
+  (void)flags;
+
+  assert_int32(1, ==, stream_id);
+  assert_size(len, <=, sizeof(acc->buf) - acc->length);
+  memcpy(acc->buf + acc->length, data, len);
+  acc->length += len;
+  return 0;
+}
+
+void test_nghttp2_http_connect_2xx_tunnel(void) {
+  static const struct {
+    const char *method;
+    const char *status;
+    const char *content_length;
+    size_t data_length;
+    int header_error;
+    int data_error;
+  } cases[] = {
+    {"CONNECT", "200", NULL, 6, 0, 0},      {"CONNECT", "200", "1", 6, 0, 0},
+    {"CONNECT", "201", NULL, 6, 0, 0},      {"CONNECT", "204", NULL, 6, 0, 0},
+    {"CONNECT", "204", "0", 6, 0, 0},       {"CONNECT", "204", "1", 6, 0, 0},
+    {"CONNECT", "204", "ignored", 6, 0, 0}, {"CONNECT", "205", NULL, 6, 0, 0},
+    {"CONNECT", "299", "1", 6, 0, 0},       {"CONNECT", "300", "6", 6, 0, 0},
+    {"CONNECT", "304", "6", 0, 0, 0},       {"CONNECT", "304", "6", 6, 0, 1},
+    {"CONNECT", "403", NULL, 6, 0, 0},      {"CONNECT", "407", "6", 6, 0, 0},
+    {"CONNECT", "407", "5", 6, 0, 1},       {"CONNECT", "407", "7", 6, 0, 1},
+    {"CONNECT", "407", "ignored", 6, 1, 0}, {"CONNECT", "199", NULL, 6, 0, 1},
+    {"HEAD", "200", "6", 0, 0, 0},          {"HEAD", "200", "6", 6, 0, 1},
+    {"HEAD", "204", "0", 6, 0, 1},          {"GET", "204", NULL, 6, 0, 1},
+    {"GET", "204", "0", 0, 0, 0},           {"GET", "204", "0", 6, 0, 1},
+    {"GET", "204", "1", 6, 1, 0},           {"GET", "304", "6", 0, 0, 0},
+    {"GET", "304", "6", 6, 0, 1},           {"GET", "200", "6", 6, 0, 0},
+  };
+  static const nghttp2_session_callbacks callbacks = {
+    .send_callback2 = null_send_callback,
+    .on_data_chunk_recv_callback = tunnel_data_chunk_recv_callback,
+  };
+  static const uint8_t payload[] = "tunnel";
+  nghttp2_mem *mem = nghttp2_mem_default();
+  size_t i;
+
+  for (i = 0; i < ARRLEN(cases); ++i) {
+    nghttp2_session *session;
+    nghttp2_hd_deflater deflater;
+    nghttp2_bufs bufs;
+    accumulator acc = {0};
+    nghttp2_outbound_item *item;
+    nghttp2_frame_hd hd;
+    nghttp2_nv request[] = {
+      MAKE_NV(":method", "GET"),
+      MAKE_NV(":authority", "localhost:443"),
+      MAKE_NV(":scheme", "https"),
+      MAKE_NV(":path", "/"),
+    };
+    nghttp2_nv response[] = {
+      MAKE_NV(":status", "200"),
+      MAKE_NV("content-length", "0"),
+    };
+    nghttp2_ssize rv;
+    size_t request_length = strcmp(cases[i].method, "CONNECT") == 0 ? 2 : 4;
+    size_t response_length = cases[i].content_length ? 2 : 1;
+    size_t first_length = cases[i].data_length / 2;
+    size_t last_length = cases[i].data_length - first_length;
+
+    request[0].value = (uint8_t *)cases[i].method;
+    request[0].valuelen = strlen(cases[i].method);
+    response[0].value = (uint8_t *)cases[i].status;
+    response[0].valuelen = strlen(cases[i].status);
+    if (cases[i].content_length) {
+      response[1].value = (uint8_t *)cases[i].content_length;
+      response[1].valuelen = strlen(cases[i].content_length);
+    }
+
+    frame_pack_bufs_init(&bufs);
+    nghttp2_hd_deflate_init(&deflater, mem);
+    assert_int(0, ==, nghttp2_session_client_new(&session, &callbacks, &acc));
+
+    /* Record the real submitted request method; do not set internal method
+       flags by hand.  A half-closed request can still receive tunnel DATA. */
+    assert_int32(1, ==,
+                 nghttp2_submit_request2(session, NULL, request, request_length,
+                                         NULL, NULL));
+    assert_int(0, ==, nghttp2_session_send(session));
+    assert_int(0, ==,
+               pack_headers(&bufs, &deflater, 1, NGHTTP2_FLAG_END_HEADERS,
+                            response, response_length, mem));
+    rv = nghttp2_session_mem_recv2(session, bufs.head->buf.pos,
+                                   nghttp2_buf_len(&bufs.head->buf));
+    assert_ptrdiff((nghttp2_ssize)nghttp2_buf_len(&bufs.head->buf), ==, rv);
+    item = nghttp2_session_get_next_ob_item(session);
+
+    if (cases[i].header_error) {
+      assert_not_null(item);
+      assert_uint8(NGHTTP2_RST_STREAM, ==, item->frame.hd.type);
+      assert_uint32(NGHTTP2_PROTOCOL_ERROR, ==,
+                    item->frame.rst_stream.error_code);
+    } else {
+      assert_null(item);
+      nghttp2_bufs_reset(&bufs);
+
+      /* Split the payload across DATA frames, then finish the receive side.
+         A tunnel must accept both frames despite a 204 or misleading CL. */
+      nghttp2_frame_hd_init(&hd, first_length, NGHTTP2_DATA, NGHTTP2_FLAG_NONE,
+                            1);
+      nghttp2_frame_pack_frame_hd(bufs.head->buf.last, &hd);
+      bufs.head->buf.last += NGHTTP2_FRAME_HDLEN;
+      memcpy(bufs.head->buf.last, payload, first_length);
+      bufs.head->buf.last += first_length;
+      nghttp2_frame_hd_init(&hd, last_length, NGHTTP2_DATA,
+                            NGHTTP2_FLAG_END_STREAM, 1);
+      nghttp2_frame_pack_frame_hd(bufs.head->buf.last, &hd);
+      bufs.head->buf.last += NGHTTP2_FRAME_HDLEN;
+      memcpy(bufs.head->buf.last, payload + first_length, last_length);
+      bufs.head->buf.last += last_length;
+
+      rv = nghttp2_session_mem_recv2(session, bufs.head->buf.pos,
+                                     nghttp2_buf_len(&bufs.head->buf));
+      assert_ptrdiff((nghttp2_ssize)nghttp2_buf_len(&bufs.head->buf), ==, rv);
+      item = nghttp2_session_get_next_ob_item(session);
+      if (cases[i].data_error) {
+        assert_not_null(item);
+        assert_uint8(NGHTTP2_RST_STREAM, ==, item->frame.hd.type);
+        assert_uint32(NGHTTP2_PROTOCOL_ERROR, ==,
+                      item->frame.rst_stream.error_code);
+      } else {
+        assert_null(item);
+        assert_size(cases[i].data_length, ==, acc.length);
+        assert_memory_equal(acc.length, payload, acc.buf);
+      }
+    }
+
+    nghttp2_session_del(session);
+    nghttp2_hd_deflate_free(&deflater);
+    nghttp2_bufs_free(&bufs);
+  }
 }
 
 void test_nghttp2_http_record_request_method(void) {
